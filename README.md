@@ -120,3 +120,20 @@ In progress:
 python inference.py \
   --model deepseek-r1-1.5b.n730 \
   --prompt "What is 2+2?"
+```
+
+Project Goals
+ - Make AI inference accessible on low-end hardware
+ - Explore streamed transformer execution
+ - Research memory-virtualized inference systems
+ - Build a fully open-source experimental runtime
+ 
+## Disclaimer
+
+N730 is an experimental research project.
+
+Performance, correctness, and stability are still under active development.
+
+This project is not affiliated with NVIDIA, DeepSeek, HuggingFace, or any model provider.
+
+## License: MIT License
