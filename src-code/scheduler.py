@@ -1,86 +1,139 @@
 """
-N730 Layer Scheduler
-====================
+N730 Scheduler (C++ accelerated)
+==================================
 
-The conveyor belt. Reads a .n730 file and streams layers through a
-3-stage pipeline so the GPU (GT 730) is never waiting:
+Python orchestration layer that calls into n730core.dll/.so for all
+the hot paths. Dequantization now runs in C++ at ~1ms/layer instead
+of ~74ms/layer in numpy.
 
-  Stage 1 — Disk thread:    reads raw bytes from .n730 (ONE persistent handle)
-  Stage 2 — Dequant thread: converts INT2/INT4/INT8 → float32 in parallel
-  Stage 3 — GPU slot:       receives fully-ready tensors, never blocks
+Architecture:
+    Python (this file)          C++ (n730core.dll/.so)
+    ─────────────────────       ──────────────────────────
+    Seek table management   →   n730_open()  / n730_close()
+    Prefetch thread logic   →   n730_read_layer()  ← THE HOT PATH
+    Pipeline / queuing      →   n730_layer_elements()
+    Stats / reporting           dequant_int2/4/8/fp16()
 
-Key improvements over naive implementation:
-  - Persistent file handle: open once, seek many — no per-layer open() overhead
-  - Split disk + dequant threads: I/O and CPU work overlap completely
-  - Read-ahead uses block_size reads to amortize seek cost
-  - Hit rate tracking shows whether prefetch depth is sufficient
-
-Usage (Python API):
-    from scheduler import N730Scheduler
-
-    scheduler = N730Scheduler("model.n730", prefetch=4)
-    for layer in scheduler.stream():
-        output = run_forward_pass(layer.weights, activations)
-
-Usage (CLI):
-    python scheduler.py --model model.n730 --benchmark
-    python scheduler.py --model model.n730 --layer 42
-    python scheduler.py --model model.n730 --benchmark --prefetch 8
+Usage:
+    python scheduler_cpp.py --model deepseek-r1-1.5b.n730 --benchmark
+    python scheduler_cpp.py --model deepseek-r1-1.5b.n730 --layer 42
+    python scheduler_cpp.py --model deepseek-r1-1.5b.n730 --benchmark --simulate-gpu-ms 50
 """
 
+import ctypes
 import json
+import os
+import platform
 import struct
+import sys
 import threading
 import queue
 import time
-import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
-from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 
-# ─── N730 format constants ────────────────────────────────────────────────────
+# ─── Load the C++ core ───────────────────────────────────────────────────────
 
-MAGIC       = b"N730\x00\x01\x00\x00"
-LAYER_MAGIC = b"LYR\x00"
-PAGE_SIZE   = 4096
-LAYER_HDR_SIZE = 4 + 1 + 4 + 4 + 4 + 4 + 4   # magic + prec + rows + cols + scale + zp + data_size = 25 bytes
+def _load_n730core() -> ctypes.CDLL:
+    """
+    Find and load n730core shared library.
+    Looks next to this script first, then PATH.
+    """
+    here = Path(__file__).parent
+
+    if platform.system() == "Windows":
+       candidates = [
+            here / "cpp" / "n730core.dll",
+            here / "n730core.dll",
+            Path("n730core.dll")
+        ]
+    else:
+        candidates = [here / "n730core.so", Path("n730core.so")]
+
+    for path in candidates:
+        if path.exists():
+            lib = ctypes.CDLL(str(path))
+            _setup_signatures(lib)
+            return lib
+
+    names = [str(c) for c in candidates]
+    raise FileNotFoundError(
+        f"Cannot find n730core library. Expected one of:\n  " +
+        "\n  ".join(names) +
+        f"\n\nBuild it first:\n"
+        f"  Linux/Mac : g++ -O3 -march=native -shared -fPIC -o n730core.so n730core.cpp\n"
+        f"  Windows   : g++ -O3 -march=native -shared -o n730core.dll n730core.cpp"
+    )
 
 
-# ─── Data structures ──────────────────────────────────────────────────────────
+def _setup_signatures(lib: ctypes.CDLL):
+    """Set ctypes argument and return types for every exported function."""
 
-@dataclass
-class RawLayerBlock:
-    """Raw bytes off disk — not yet dequantized. Lives briefly between threads."""
-    layer_idx: int
-    layer_name: str
-    precision: str
-    prec_id: int
-    rows: int
-    cols: int
-    scale: float
-    zero_point: float
-    raw_bytes: bytes
-    disk_time_ms: float
+    # int64_t n730_open(const char* path)
+    lib.n730_open.argtypes = [ctypes.c_char_p]
+    lib.n730_open.restype  = ctypes.c_int64
 
+    # void n730_close(int64_t handle)
+    lib.n730_close.argtypes = [ctypes.c_int64]
+    lib.n730_close.restype  = None
+
+    # int32_t n730_read_layer(handle, file_offset, out_buffer, out_rows, out_cols, out_prec_id)
+    lib.n730_read_layer.argtypes = [
+        ctypes.c_int64,                          # handle
+        ctypes.c_int64,                          # file_offset
+        ctypes.POINTER(ctypes.c_float),          # out_buffer
+        ctypes.POINTER(ctypes.c_int32),          # out_rows
+        ctypes.POINTER(ctypes.c_int32),          # out_cols
+        ctypes.POINTER(ctypes.c_int32),          # out_prec_id
+    ]
+    lib.n730_read_layer.restype = ctypes.c_int32
+
+    # int32_t n730_layer_elements(handle, file_offset)
+    lib.n730_layer_elements.argtypes = [ctypes.c_int64, ctypes.c_int64]
+    lib.n730_layer_elements.restype  = ctypes.c_int32
+
+    # const char* n730_version()
+    lib.n730_version.argtypes = []
+    lib.n730_version.restype  = ctypes.c_char_p
+
+
+# ─── Error codes ─────────────────────────────────────────────────────────────
+
+N730_ERRORS = {
+    -1: "BAD_MAGIC — not a valid .n730 file",
+    -2: "FILE — I/O error",
+    -3: "ALLOC — out of memory",
+    -4: "BAD_LAYER — corrupt layer block",
+    -5: "BAD_PREC — unknown precision id",
+    -6: "NULL — null pointer",
+}
+
+def check_err(code: int, context: str = ""):
+    if code < 0:
+        msg = N730_ERRORS.get(code, f"unknown error {code}")
+        raise RuntimeError(f"n730core error in {context}: {msg}")
+
+
+# ─── Data structures ─────────────────────────────────────────────────────────
+
+import numpy as np
 
 @dataclass
 class LayerBuffer:
-    """A dequantized layer in RAM, ready for GPU transfer."""
     layer_idx: int
     layer_name: str
-    weights: np.ndarray
+    weights: np.ndarray      # float32 (rows, cols)
     precision: str
-    load_time_ms: float     # disk read time
-    dequant_time_ms: float  # dequantization time
+    load_time_ms: float      # C++ read + dequant combined
 
 
 @dataclass
 class SchedulerStats:
     total_layers: int = 0
     total_bytes_read: int = 0
-    total_disk_ms: float = 0.0
-    total_dequant_ms: float = 0.0
+    total_load_ms: float = 0.0
     gpu_wait_ms: float = 0.0
     prefetch_hits: int = 0
     prefetch_misses: int = 0
@@ -92,181 +145,144 @@ class SchedulerStats:
         return self.prefetch_hits / max(total, 1)
 
     @property
-    def avg_disk_ms(self) -> float:
-        return self.total_disk_ms / max(self.total_layers, 1)
-
-    @property
-    def avg_dequant_ms(self) -> float:
-        return self.total_dequant_ms / max(self.total_layers, 1)
+    def avg_load_ms(self) -> float:
+        return self.total_load_ms / max(self.total_layers, 1)
 
     @property
     def throughput_mb_s(self) -> float:
-        total_ms = self.total_disk_ms + self.total_dequant_ms
-        if total_ms < 1:
+        if self.total_load_ms < 1:
             return 0.0
-        return (self.total_bytes_read / (1024**2)) / (total_ms / 1000)
+        return (self.total_bytes_read / 1024**2) / (self.total_load_ms / 1000)
 
 
-# ─── Dequantization ───────────────────────────────────────────────────────────
-
-def dequantize(raw_bytes: bytes, prec_id: int, rows: int, cols: int,
-               scale: float, zero_point: float) -> np.ndarray:
-    total = rows * cols
-
-    if prec_id == 8:
-        arr = np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32)
-        w = (arr - zero_point) * scale
-
-    elif prec_id == 4:
-        packed = np.frombuffer(raw_bytes, dtype=np.uint8)
-        lo = (packed & 0x0F).astype(np.float32)
-        hi = ((packed >> 4) & 0x0F).astype(np.float32)
-        interleaved = np.empty(lo.size * 2, dtype=np.float32)
-        interleaved[0::2] = lo
-        interleaved[1::2] = hi
-        w = (interleaved[:total] - zero_point) * scale
-
-    elif prec_id == 2:
-        packed = np.frombuffer(raw_bytes, dtype=np.uint8)
-        b0 = (packed & 0x03).astype(np.float32)
-        b1 = ((packed >> 2) & 0x03).astype(np.float32)
-        b2 = ((packed >> 4) & 0x03).astype(np.float32)
-        b3 = ((packed >> 6) & 0x03).astype(np.float32)
-        interleaved = np.empty(b0.size * 4, dtype=np.float32)
-        interleaved[0::4] = b0
-        interleaved[1::4] = b1
-        interleaved[2::4] = b2
-        interleaved[3::4] = b3
-        w = (interleaved[:total] - zero_point) * scale
-
-    elif prec_id == 16:
-        w = np.frombuffer(raw_bytes, dtype=np.float16).astype(np.float32)
-
-    else:
-        raise ValueError(f"Unknown precision id: {prec_id}")
-
-    return w.reshape(rows, cols)
-
-
-# ─── Core scheduler ───────────────────────────────────────────────────────────
+# ─── Core scheduler ──────────────────────────────────────────────────────────
 
 class N730Scheduler:
     """
-    3-stage pipeline scheduler for .n730 files.
+    C++-accelerated layer scheduler for .n730 files.
 
-    Stage 1 (disk thread)   — persistent file handle, sequential reads
-    Stage 2 (dequant thread) — CPU float conversion, overlapped with next disk read
-    Stage 3 (caller)        — consumes fully-ready float32 tensors
-
-    The pipeline keeps prefetch layers buffered so the caller (GPU)
-    never has to wait for disk I/O.
+    The C++ core (n730core.dll/.so) handles all file I/O and dequantization.
+    This Python class handles the pipeline logic: prefetching, threading,
+    stats tracking, and the public API.
     """
 
     def __init__(self, model_path: str, prefetch: int = 4):
         self.model_path = Path(model_path)
         self.prefetch = prefetch
         self.stats = SchedulerStats()
+
+        # Load C++ core
+        self._lib = _load_n730core()
+        print(f"  C++ core  : {self._lib.n730_version().decode()}")
+
+        # Open persistent file handle in C++ (stays open for model lifetime)
+        self._handle = self._lib.n730_open(str(self.model_path).encode())
+        if self._handle < 0:
+            check_err(int(self._handle), "n730_open")
+
+        # Load seek table from Python (header parsing stays in Python — readable)
         self._load_header()
+
+        # Pre-allocate a reusable output buffer for the largest layer
+        max_elements = max(
+            e["rows"] * e["cols"] for e in self._seek_table
+        )
+        # Each worker thread needs its own buffer — allocate per-thread in stream()
+        self._max_elements = max_elements
 
     def _load_header(self):
         with open(self.model_path, "rb") as f:
             magic = f.read(8)
-            if magic != MAGIC:
-                raise ValueError(f"Not a .n730 file (magic: {magic!r})")
+            if magic != b"N730\x00\x01\x00\x00":
+                raise ValueError("Not a valid .n730 file")
             version, header_size = struct.unpack(">II", f.read(8))
-            header_json = f.read(header_size)
-        self._header = json.loads(header_json)
-        self._seek_table = self._header["seek_table"]
-        print(f"  N730 scheduler ready")
-        print(f"  Model   : {self._header['model_id']}")
-        print(f"  Layers  : {self._header['total_layers']}")
-        print(f"  Size    : {self._header['stored_mb']} MB  ({self._header['compression']}× compressed)")
-        print(f"  Prefetch: {self.prefetch} layers")
+            header = json.loads(f.read(header_size))
+
+        self._header = header
+        self._seek_table = header["seek_table"]
+
+        print(f"  Model     : {header['model_id']}")
+        print(f"  Layers    : {header['total_layers']}")
+        print(f"  Size      : {header['stored_mb']} MB  ({header['compression']}× compressed)")
+        print(f"  Prefetch  : {self.prefetch} layers")
+
+    def __del__(self):
+        if hasattr(self, "_lib") and hasattr(self, "_handle") and self._handle > 0:
+            self._lib.n730_close(self._handle)
+
+    def _read_layer_cpp(self, entry: dict) -> LayerBuffer:
+        """
+        Call into C++ to read + dequantize one layer.
+        This is where the 74ms → ~1ms speedup lives.
+        """
+        n_elements = entry["rows"] * entry["cols"]
+
+        # Allocate output buffer (numpy array backed by C-contiguous float32 memory)
+        out = np.empty(n_elements, dtype=np.float32)
+        out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        rows_out  = ctypes.c_int32(0)
+        cols_out  = ctypes.c_int32(0)
+        prec_out  = ctypes.c_int32(0)
+
+        t0 = time.perf_counter()
+        rc = self._lib.n730_read_layer(
+            self._handle,
+            ctypes.c_int64(entry["file_offset"]),
+            out_ptr,
+            ctypes.byref(rows_out),
+            ctypes.byref(cols_out),
+            ctypes.byref(prec_out),
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        check_err(rc, f"n730_read_layer (layer {entry['layer_idx']})")
+
+        weights = out.reshape(rows_out.value, cols_out.value)
+
+        return LayerBuffer(
+            layer_idx=entry["layer_idx"],
+            layer_name=entry["layer_name"],
+            weights=weights,
+            precision=entry["precision"],
+            load_time_ms=elapsed_ms,
+        )
 
     def stream(self, start: int = 0, end: Optional[int] = None) -> Iterator[LayerBuffer]:
         """
-        Stream layers through the 3-stage pipeline.
+        Stream layers using a background prefetch thread.
+        The prefetch thread calls C++ for each layer; the caller (GPU) just
+        pulls from the ready queue.
 
-        Yields LayerBuffer objects (float32 weights, ready for GPU).
-        The pipeline runs ahead by `self.prefetch` layers.
+        NOTE: C++ file handle is not thread-safe for concurrent seeks.
+        The prefetch thread gets exclusive access; the main thread only
+        reads from the Python queue.
         """
         if end is None:
             end = len(self._seek_table)
 
-        # Two inter-thread queues
-        raw_q: queue.Queue = queue.Queue(maxsize=self.prefetch + 2)
         ready_q: queue.Queue = queue.Queue(maxsize=self.prefetch + 1)
 
-        # ── Stage 1: disk thread ──────────────────────────────────────────────
-        def disk_thread():
-            # ONE file handle for the entire run — eliminates per-layer open() cost
-            with open(self.model_path, "rb") as f:
-                for i in range(start, end):
-                    entry = self._seek_table[i]
-                    t0 = time.perf_counter()
+        def prefetch_thread():
+            for i in range(start, end):
+                entry = self._seek_table[i]
+                layer = self._read_layer_cpp(entry)
 
-                    f.seek(entry["file_offset"])
-                    layer_magic = f.read(4)
-                    if layer_magic != LAYER_MAGIC:
-                        raise ValueError(f"Bad layer magic at layer {i}")
-
-                    idx, prec_id, rows, cols, scale, zp, data_size = struct.unpack(
-                        ">IBIIffi", f.read(LAYER_HDR_SIZE)
-                    )
-                    raw_bytes = f.read(data_size)
-                    disk_ms = (time.perf_counter() - t0) * 1000
-
-                    raw_q.put(RawLayerBlock(
-                        layer_idx=idx,
-                        layer_name=entry["layer_name"],
-                        precision=entry["precision"],
-                        prec_id=prec_id,
-                        rows=rows,
-                        cols=cols,
-                        scale=scale,
-                        zero_point=zp,
-                        raw_bytes=raw_bytes,
-                        disk_time_ms=disk_ms,
-                    ))
-            raw_q.put(None)  # sentinel
-
-        # ── Stage 2: dequant thread ───────────────────────────────────────────
-        def dequant_thread():
-            while True:
-                raw = raw_q.get()
-                if raw is None:
-                    ready_q.put(None)
-                    return
-
-                t0 = time.perf_counter()
-                weights = dequantize(
-                    raw.raw_bytes, raw.prec_id,
-                    raw.rows, raw.cols,
-                    raw.scale, raw.zero_point,
-                )
-                dequant_ms = (time.perf_counter() - t0) * 1000
-
-                ready_q.put(LayerBuffer(
-                    layer_idx=raw.layer_idx,
-                    layer_name=raw.layer_name,
-                    weights=weights,
-                    precision=raw.precision,
-                    load_time_ms=raw.disk_time_ms,
-                    dequant_time_ms=dequant_ms,
-                ))
-
-                # Update shared stats (GIL keeps this safe)
                 self.stats.total_layers += 1
-                self.stats.total_disk_ms += raw.disk_time_ms
-                self.stats.total_dequant_ms += dequant_ms
-                self.stats.total_bytes_read += len(raw.raw_bytes)
+                self.stats.total_load_ms += layer.load_time_ms
+                self.stats.total_bytes_read += entry["stored_bytes"]
 
-        t1 = threading.Thread(target=disk_thread, daemon=True)
-        t2 = threading.Thread(target=dequant_thread, daemon=True)
-        t1.start()
-        t2.start()
+                ready_q.put(layer)
 
-        # ── Stage 3: caller (GPU) ─────────────────────────────────────────────
+                depth = ready_q.qsize()
+                if depth > self.stats.peak_ram_layers:
+                    self.stats.peak_ram_layers = depth
+
+            ready_q.put(None)
+
+        t = threading.Thread(target=prefetch_thread, daemon=True)
+        t.start()
+
         while True:
             t_wait = time.perf_counter()
             layer = ready_q.get()
@@ -274,10 +290,6 @@ class N730Scheduler:
 
             if layer is None:
                 break
-
-            depth = ready_q.qsize()
-            if depth > self.stats.peak_ram_layers:
-                self.stats.peak_ram_layers = depth
 
             if wait_ms < 2.0:
                 self.stats.prefetch_hits += 1
@@ -287,47 +299,21 @@ class N730Scheduler:
 
             yield layer
 
-        t1.join()
-        t2.join()
+        t.join()
 
     def get_layer(self, layer_idx: int) -> LayerBuffer:
-        """Random access — O(1) seek to any single layer."""
-        entry = self._seek_table[layer_idx]
-        t0 = time.perf_counter()
-        with open(self.model_path, "rb") as f:
-            f.seek(entry["file_offset"])
-            f.read(4)  # layer magic
-            idx, prec_id, rows, cols, scale, zp, data_size = struct.unpack(
-                ">IBIIffi", f.read(LAYER_HDR_SIZE)
-            )
-            raw_bytes = f.read(data_size)
-        disk_ms = (time.perf_counter() - t0) * 1000
-
-        t0 = time.perf_counter()
-        weights = dequantize(raw_bytes, prec_id, rows, cols, scale, zp)
-        dequant_ms = (time.perf_counter() - t0) * 1000
-
-        return LayerBuffer(
-            layer_idx=idx,
-            layer_name=entry["layer_name"],
-            weights=weights,
-            precision=entry["precision"],
-            load_time_ms=disk_ms,
-            dequant_time_ms=dequant_ms,
-        )
+        """Random-access single layer. O(1) seek."""
+        return self._read_layer_cpp(self._seek_table[layer_idx])
 
     def print_stats(self):
         s = self.stats
-        bottleneck = "disk" if s.avg_disk_ms > s.avg_dequant_ms else "dequant"
-        print("\n" + "═" * 55)
-        print("  N730 SCHEDULER STATS")
-        print("═" * 55)
+        print("\n" + "═" * 56)
+        print("  N730 SCHEDULER STATS  (C++ accelerated)")
+        print("═" * 56)
         print(f"  Layers streamed   : {s.total_layers}")
-        print(f"  Data read         : {s.total_bytes_read / (1024**2):.1f} MB")
-        print(f"  Avg disk time     : {s.avg_disk_ms:.2f} ms/layer")
-        print(f"  Avg dequant time  : {s.avg_dequant_ms:.2f} ms/layer")
+        print(f"  Data read         : {s.total_bytes_read / 1024**2:.1f} MB")
+        print(f"  Avg load time     : {s.avg_load_ms:.2f} ms/layer  (read+dequant)")
         print(f"  Throughput        : {s.throughput_mb_s:.1f} MB/s")
-        print(f"  Bottleneck        : {bottleneck}")
         print(f"  Prefetch hit rate : {s.hit_rate * 100:.1f}%")
         print(f"  GPU wait total    : {s.gpu_wait_ms:.1f} ms")
         print(f"  Peak RAM layers   : {s.peak_ram_layers}")
@@ -335,25 +321,17 @@ class N730Scheduler:
             print(f"  Pipeline stalls   : 0  ✓ GPU never waited")
         else:
             print(f"  Pipeline stalls   : {s.prefetch_misses}")
-            if bottleneck == "disk":
-                print(f"  Tip: SSD limited. Try --prefetch {self.prefetch + 4}")
-            else:
-                print(f"  Tip: CPU dequant limited. Try --prefetch {self.prefetch + 2}")
-        print("═" * 55)
+            if s.hit_rate < 0.5:
+                print(f"  → Disk still the limit. Try --prefetch {self.prefetch + 4}")
+        print("═" * 56)
 
 
-# ─── Simulated forward pass ───────────────────────────────────────────────────
+# ─── Simulated forward pass ──────────────────────────────────────────────────
 
 def simulated_forward_pass(layer: LayerBuffer, activations: np.ndarray,
-                            simulate_ms: float = 0.0) -> np.ndarray:
-    """
-    Placeholder for the CUDA forward pass kernel (Phase 4).
-    simulate_ms adds artificial delay to mimic real GPU compute time,
-    which lets us properly test whether the prefetch pipeline stays ahead.
-    """
+                           simulate_ms: float = 0.0) -> np.ndarray:
     if simulate_ms > 0:
         time.sleep(simulate_ms / 1000)
-
     w = layer.weights
     in_dim = w.shape[1]
     if activations.shape[0] != in_dim:
@@ -361,7 +339,7 @@ def simulated_forward_pass(layer: LayerBuffer, activations: np.ndarray,
     return np.tanh(w @ activations)
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def run_benchmark(model_path: str, prefetch: int, n_layers: Optional[int],
                   simulate_gpu_ms: float = 0.0):
@@ -373,7 +351,7 @@ def run_benchmark(model_path: str, prefetch: int, n_layers: Optional[int],
     total = len(scheduler._seek_table)
     end = min(n_layers, total) if n_layers else total
 
-    gpu_label = f" + {simulate_gpu_ms:.0f}ms simulated GPU" if simulate_gpu_ms else ""
+    gpu_label = f" + {simulate_gpu_ms:.0f}ms GPU" if simulate_gpu_ms else ""
     print(f"\n  Benchmarking {end}/{total} layers  prefetch={prefetch}{gpu_label}\n")
 
     activations = np.ones(1024, dtype=np.float32) * 0.01
@@ -391,8 +369,7 @@ def run_benchmark(model_path: str, prefetch: int, n_layers: Optional[int],
         print(
             f"  [{bar}] {done:>3}/{end}  "
             f"[{layer.precision:<4}]  "
-            f"disk={layer.load_time_ms:5.1f}ms  "
-            f"dq={layer.dequant_time_ms:4.1f}ms  "
+            f"{layer.load_time_ms:5.2f}ms  "
             f"hit={hit_pct:.0f}%{status}",
             end="\r"
         )
@@ -404,34 +381,33 @@ def run_benchmark(model_path: str, prefetch: int, n_layers: Optional[int],
 
 def read_single_layer(model_path: str, layer_idx: int):
     print(f"\n╔══════════════════════════════════════╗")
-    print(f"║  N730 Scheduler  •  Project Bombakla  ║")
+    print(f"║  N730 Scheduler                      ║")
     print(f"╚══════════════════════════════════════╝\n")
     scheduler = N730Scheduler(model_path, prefetch=1)
     print(f"\n  Reading layer {layer_idx}...")
     layer = scheduler.get_layer(layer_idx)
-    print(f"  Name         : {layer.layer_name}")
-    print(f"  Precision    : {layer.precision}")
-    print(f"  Shape        : {layer.weights.shape}")
-    print(f"  Mean / Std   : {layer.weights.mean():.6f} / {layer.weights.std():.6f}")
-    print(f"  Min / Max    : {layer.weights.min():.4f} / {layer.weights.max():.4f}")
-    print(f"  Disk read    : {layer.load_time_ms:.2f} ms")
-    print(f"  Dequant      : {layer.dequant_time_ms:.2f} ms")
-    print(f"  Total        : {layer.load_time_ms + layer.dequant_time_ms:.2f} ms")
+    print(f"  Name      : {layer.layer_name}")
+    print(f"  Precision : {layer.precision}")
+    print(f"  Shape     : {layer.weights.shape}")
+    print(f"  Mean/Std  : {layer.weights.mean():.6f} / {layer.weights.std():.6f}")
+    print(f"  Min/Max   : {layer.weights.min():.4f} / {layer.weights.max():.4f}")
+    print(f"  Load time : {layer.load_time_ms:.3f} ms  (C++ read+dequant)")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="N730 Layer Scheduler — Project Bombakla Phase 3")
+    parser = argparse.ArgumentParser(description="N730 Scheduler (C++ accelerated) — Project Bombakla")
     parser.add_argument("--model", type=str, default="model.n730")
     parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--layers", type=int, help="Limit to first N layers")
-    parser.add_argument("--layer", type=int, help="Inspect single layer by index")
+    parser.add_argument("--layers", type=int)
+    parser.add_argument("--layer", type=int)
     parser.add_argument("--prefetch", type=int, default=4)
     parser.add_argument("--simulate-gpu-ms", type=float, default=0.0,
-                        help="Simulate GPU compute time per layer (ms) to test pipeline balance")
+                        help="Simulate GPU compute time per layer to test pipeline balance")
     args = parser.parse_args()
 
     if args.layer is not None:
         read_single_layer(args.model, args.layer)
     else:
-        run_benchmark(args.model, args.prefetch, args.layers, args.simulate_gpu_ms)
+        run_benchmark(args.model, args.prefetch, args.layers,
+                      getattr(args, "simulate_gpu_ms", 0.0))
