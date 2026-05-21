@@ -40,62 +40,9 @@ The goal is to make AI inference possible on hardware that should theoretically 
 
 ---
 
-## Architecture
-
-N730 currently consists of:
-
-### `converter.py`
-Converts HuggingFace transformer models into the `.n730` streaming format.
-
-Features:
-- Layer sensitivity profiling
-- Mixed-precision quantization
-- Big-endian packed layer storage
-- O(1) seek-table-based layer access
-
----
-
-### `scheduler.py`
-The streaming runtime responsible for:
-- Layer prefetching
-- Disk scheduling
-- RAM staging
-- Runtime dequantization
-- Async pipeline management
-
----
-
-### `n730core.cpp`
-Native AVX2-accelerated runtime core.
-
-Handles:
-- INT2 / INT4 / INT8 dequantization
-- Persistent model file handles
-- Zero-copy layer reads
-- Streaming layer unpacking
-
-Compiled as:
-- `n730core.dll` (Windows)
-- `n730core.so` (Linux)
-
----
-
-### `inference.py`
-The actual transformer inference engine.
-
-Implements:
-- Rotary Position Embeddings (RoPE)
-- Grouped Query Attention (GQA)
-- RMSNorm
-- KV cache
-- Top-p sampling
-- Streaming autoregressive generation
-
----
-
 ## Current Status
 
-N730 is currently in active experimental development.
+N730 is currently in active experimental development. And prints shyt.
 
 Working:
 - Native C++ runtime
@@ -111,6 +58,7 @@ In progress:
 - Optimized transformer kernels
 - Better scheduler overlap
 - Full GPU inference path
+- Making it not shyt
 
 ---
 
@@ -130,10 +78,10 @@ Project Goals
  
 ## Disclaimer
 
-N730 is an experimental research project.
+N730 is an experimental research project haha.
 
-Performance, correctness, and stability are still under active development.
+Performance, correctness, and stability are not working send help pls
 
-This project is not affiliated with NVIDIA, DeepSeek, HuggingFace, or any model provider.
+This project is not affiliated with NVIDIA, DeepSeek, HuggingFace, or any model provider. F*ck big model providers.
 
 ## License: MIT License
