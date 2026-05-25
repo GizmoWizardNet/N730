@@ -213,21 +213,15 @@ models far larger than GPU memory capacity to run on legacy hardware.
 ```
 ---
 
-## Architecture
+## Status
 
-```text
-Disk Storage
-     ↓
-Streaming Scheduler
-     ↓
-RAM Prefetch Queue
-     ↓
-GPU Upload
-     ↓
-CUDA Transformer Kernels
-     ↓
-Autoregressive Token Generation
-```
+ <p align="left">
+  <img src="git-assets/screen0.png">
+</p>
+
+ <p align="right">
+  <img src="git-assets/screen1.png">
+</p>
 
 ---
 
@@ -242,27 +236,6 @@ The goal is not maximum speed.
 
 The goal is making AI inference possible on hardware that should
 theoretically be incapable of running it.
-
----
-
-## Current Status
-
-### Working
-
-- Native C++ runtime
-- Streaming scheduler
-- Quantized layer loading
-- KV cache
-- Autoregressive generation
-- HuggingFace tokenizer integration
-
-### In Progress
-
-- Numerical correctness validation
-- Faster CUDA kernels
-- Better scheduler overlap
-- Full GPU execution path
-- Making it not shyt
 
 ---
 
@@ -283,13 +256,14 @@ theoretically be incapable of running it.
 |---|---|
 | GT 730 2GB DDR3 | Working |
 | GTX 1650 | Untested |
-| RTX Series | Probably works |
+| RTX Series | Needs re-done compiler with different instruction set |
 
 ---
 
 ## License
 
 MIT
+
 ## Disclaimer
 
 N730 is an experimental research project haha.
@@ -297,5 +271,3 @@ N730 is an experimental research project haha.
 Performance, correctness, and stability are not working send help pls
 
 This project is not affiliated with NVIDIA, DeepSeek, HuggingFace, or any model provider. F*ck big model providers.
-
-## License: MIT License
