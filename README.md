@@ -40,72 +40,10 @@ models far larger than GPU memory capacity to run on legacy hardware.
 - HuggingFace conversion pipeline
 
 ---
-
-## Quick Setup
-
-```powershell
-
-  #Compile the core (Win CPP)
-  #Recommended and tested setup: VS2019, MSVC v142 and C++ Desktop Workload(full)
-  #CUDA 11.4 to 9.0 ONLY
-  #Open x64 Native Tools Command Prompt for VS2019
-  #Run (inside directory src-code/cpp):
-
-  cl /O2 /arch:AVX2 /LD n730core.cpp /Fe:n730core.dll
-
-  #Compile the CUDA kernel
-
-  "cuda_installation_folder\bin\nvcc.exe" -O3 -arch=sm_35 --shared -lcublas -o n730_cuda.dll n730_cuda.cu
-
-  #Run the profiler with a model (example: deepseek-r1-1.5b-v2)
-
-  python src-code/profiler.py --model <hf-model-id-or-local-cache> --output sensitivity_map.json
-
-  #On Windows, model cache(for Deepseek) usually exists in: C:\Users\<your-username>\.cache\huggingface\hub\models--deepseek-ai--deepseek-r1-distill-qwen-1.5b\snapshots\<some-kind-of-hash>
-
-  #Now run the converter to get the sensitivity INT8 map to the custom optimized .n730 format(again, given example is for Deepseek)
-
-  python converter.py --model deepseek-ai/deepseek-r1-distill-qwen-1.5b --sensitivity sensitivity_map.json --output deepseek-r1-1.5b.n730
-
-  #FINAL STEP: fucking inference, AI go brrrrrrrrr
-
-  # First run (downloads tokenizer once):
-  python inference.py --model deepseek-r1-1.5b.n730 --prompt "What is 2+2?" --max-tokens 50
-
-  # With local tokenizer cache (faster, no internet):
-  python inference.py --model deepseek-r1-1.5b.n730 --tokenizer C:\path\to\cached\model --prompt "Hello"
-
-  # Interactive chat:
-  python inference.py --model deepseek-r1-1.5b.n730 --interactive
-```
-
-## Usage(component-wise)
-
-```powershell
-#profiler(synthetic test run as well)
-
-    python profiler.py --model <path_or_hf_id> --output sensitivity_map.json
-    python profiler.py --synthetic --layers 32 --output sensitivity_map.json
-
-#converter
-
-    python converter.py --model deepseek-ai/deepseek-r1-distill-qwen-1.5b \\
-                        --sensitivity sensitivity_map.json \\
-                        --output model.n730
-
-    python converter.py --synthetic --sensitivity sensitivity_map.json \\
-                        --output model.n730
-
-#scheduler
-
-    python scheduler.py --model deepseek-r1-1.5b.n730 --benchmark
-    python scheduler.py --model deepseek-r1-1.5b.n730 --layer 42
-    python scheduler.py --model deepseek-r1-1.5b.n730 --benchmark --simulate-gpu-ms 50
-```
 ---
 
 ## Status
-
+<h2>WIP</h2>
  <p align="left">
   <img src="git-assets/screen0.png">
 </p>
@@ -154,7 +92,7 @@ Instead of loading an entire model into VRAM at once, N730 streams quantized tra
 
 ## License
 
-MIT
+MIT 
 
 ## Disclaimer
 
@@ -163,3 +101,8 @@ N730 is an experimental research project haha.
 Performance, correctness, and stability are not working send help pls
 
 This project is not affiliated with NVIDIA, DeepSeek, HuggingFace, or any model provider. F*ck big model providers.
+
+**EXTRA NOTES**
+- You are absolutely not allowed to sell or make money from this software commercially, whether it be through access limits, usage or donations.
+- If any modifications that you think would help this project further, please do a PR.
+- Grammatical or style issues do not require a PR, do an issue instead. Such PRs will be closed without notice.
