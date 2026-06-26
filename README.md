@@ -28,6 +28,7 @@ quantized transformer layers dynamically during inference, allowing
 models far larger than GPU memory capacity to run on legacy hardware.
 
 ---
+---
 
 ## Features
 
@@ -61,7 +62,6 @@ models far larger than GPU memory capacity to run on legacy hardware.
 - Running autoregressive transformer inference
 - Dynamically dequantizing INT2 / INT4 / INT8 / FP16 weights
 - Executing inference on hardware as old as the GT 730
----
 
 ## Concept
 
@@ -77,8 +77,6 @@ Instead of loading an entire model into VRAM at once, N730 streams quantized tra
 | INT8 | Working |
 | INT4 | Experimental |
 | INT2 | Experimental / cursed |
-
----
 
 ## Hardware Tested
 
